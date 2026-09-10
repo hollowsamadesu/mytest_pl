@@ -1,5 +1,5 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
-# Semi-supervised detection trainer (detection-only, no mask branch)
+# EMA-based semi-supervised detection trainer (teacher = EMA of student)
 
 from pathlib import Path
 import os
@@ -57,15 +57,20 @@ from ultralytics.utils.torch_utils import (
 from ultralytics.models.yolo.semi_detect.aug_unsup import StrongNoiseBlurAug, WeekAugmentation, HorizonFlip
 
 
-class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
+class EMASemiDetectionTrainer(yolo.detect.DetectionTrainer):
+    """
+    EMA-based semi-supervised detection trainer.
+    Student model: trained with gradients on labeled + pseudo-labeled data.
+    Teacher model: EMA of student, used only for pseudo-label generation (no gradients).
+    """
 
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         if overrides is None:
             overrides = {}
-        overrides["task"] = "semi_detect"
+        overrides["task"] = "semi_detect_ema"
         super().__init__(cfg, overrides, _callbacks)
 
-        self.ema_decay = 0.9
+        self.ema_decay = 0.99
         self.unsup_weight = getattr(self.args, "unsup_weight", 1.0)
         self.auto_train = getattr(self.args, "self_train", False)
         self.total_loss = None
@@ -74,14 +79,8 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
         self.weak_aug = WeekAugmentation()
         self.horizonFlip = HorizonFlip()
         self.reset_teacher = False
-        self.update_count = 0
-
-        # If teacher model has pretrained weights, create a separate set of parameters
-        if self.args.unsup_model:
-            self.teacher_model = check_model_file_from_stem(self.args.unsup_model)
-        else:
-            self.teacher_model = None
-        self.teacher_ema = None
+        self.teacher_model = None  # will be created as EMA of student in _setup_train
+        self.teacher_ema = None  # not used in EMA version, but needed for validator compatibility
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Create and return a SemiDetectionModel."""
@@ -91,14 +90,14 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
         return model
 
     def get_validator(self):
-        """Return a DetectionValidator for semi-supervised detection."""
+        """Return a validator for student model."""
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
         return SemiDetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=self.args, _callbacks=self.callbacks
         )
 
     def get_teacher_validator(self):
-        """Return a DetectionValidator for teacher model validation."""
+        """Return a validator for teacher model."""
         return SemiDetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=self.args, _callbacks=self.callbacks,
             teacher_model=self.teacher_model
@@ -120,49 +119,20 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
         plot_results(file=self.csv, segment=False, on_plot=self.on_plot)
 
     @torch.no_grad()
-    def update_teacher_model(self):
-        """Update the teacher model using EMA from student model."""
-        if self.reset_teacher:
-            self.teacher_model = deepcopy(self.best_student)
-            print("出现新的最优模型,重置一次教师模型\n")
-            self.reset_teacher = False
-            student_model = self.model.module if hasattr(self.model, "module") else self.model
-            teacher_model = self.teacher_model
-            self.update_count = 0
-        elif self.update_count == 30:
-            print("太久未出现优秀模型，重置教师模型且本轮不再更新教师模型")
-            best_student = self.best_student
-            student_model = self.model.module if hasattr(self.model, "module") else self.model
-            self.teacher_model = deepcopy(self.best_student)
-            for t_param, s_param in zip(self.teacher_model.parameters(), best_student.parameters()):
-                t_param.data = s_param.data
-            teacher_model = self.teacher_model
-        elif self.update_count > 30:
-            self.update_count = 0
-            return
-        else:
-            min_decay = 0.9
-            max_decay = 0.99
-            cos_value = math.cos(math.pi * self.epoch / self.epochs)
-            self.ema_decay = max_decay - 0.5 * (max_decay - min_decay) * (1 + cos_value)
+    def update_teacher_ema(self):
+        """Update teacher model via EMA from student model (pure EMA, no optimizer)."""
+        student_model = self.model.module if hasattr(self.model, "module") else self.model
+        teacher_model = self.teacher_model
 
-            student_model = self.model.module if hasattr(self.model, "module") else self.model
-            teacher_model = self.teacher_model
-            if self.best_student is None:
-                for t_param, s_param in zip(teacher_model.parameters(), student_model.parameters()):
-                    if t_param.data.shape != s_param.data.shape:
-                        print("参数shape不一致,跳过同步\n")
-                        continue
-                    t_param.data.mul_(self.ema_decay).add_(s_param.data, alpha=1.0 - self.ema_decay)
-            else:
-                best_model = self.best_student
-                alpha = (1.0 - self.ema_decay) * 0.5
-                beta = (1.0 - self.ema_decay) * 0.5
-                for t_param, s_param, b_param in zip(teacher_model.parameters(), student_model.parameters(), best_model.parameters()):
-                    if t_param.data.shape != s_param.data.shape:
-                        print("参数shape不一致,跳过同步\n")
-                        continue
-                    t_param.data.mul_(self.ema_decay).add_(s_param.data, alpha=alpha).add_(b_param.data, alpha=beta)
+        min_decay = 0.99
+        max_decay = 0.999
+        cos_value = math.cos(math.pi * self.epoch / self.epochs)
+        self.ema_decay = max_decay - 0.5 * (max_decay - min_decay) * (1 + cos_value)
+
+        for t_param, s_param in zip(teacher_model.parameters(), student_model.parameters()):
+            if t_param.data.shape != s_param.data.shape:
+                continue
+            t_param.data.mul_(self.ema_decay).add_(s_param.data, alpha=1.0 - self.ema_decay)
 
         # Sync buffers (e.g. BN running_mean, running_var)
         for t_buffer, s_buffer in zip(teacher_model.buffers(), student_model.buffers()):
@@ -170,7 +140,7 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
                 continue
             t_buffer.data.copy_(s_buffer.data)
 
-        self.teacher_model.eval()
+        teacher_model.eval()
 
     def train(self):
         """Allow device='', device=None on Multi-GPU systems to default to device=0."""
@@ -187,11 +157,11 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
 
         if world_size > 1 and "LOCAL_RANK" not in os.environ:
             if self.args.rect:
-                LOGGER.warning("WARNING ⚠️ 'rect=True' is incompatible with Multi-GPU training, setting 'rect=False'")
+                LOGGER.warning("WARNING: 'rect=True' is incompatible with Multi-GPU training, setting 'rect=False'")
                 self.args.rect = False
             if self.args.batch < 1.0:
                 LOGGER.warning(
-                    "WARNING ⚠️ 'batch<1' for AutoBatch is incompatible with Multi-GPU training, setting "
+                    "WARNING: 'batch<1' for AutoBatch is incompatible with Multi-GPU training, setting "
                     "default 'batch=16'"
                 )
                 self.args.batch = 16
@@ -236,11 +206,6 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
 
         epoch = self.start_epoch
         self.optimizer.zero_grad()
-        if self.teacher_optimizer is not None:
-            self.teacher_optimizer.zero_grad()
-
-        self.tunsup_student = None
-        self.tunsup_teacher = None
 
         while True:
             self.epoch = epoch
@@ -248,10 +213,9 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 self.scheduler.step()
-                self.teacher_scheduler.step()
 
             self.model.train()
-            self.teacher_model.train()
+            self.teacher_model.eval()  # teacher always in eval mode for pseudo-label generation
 
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
@@ -281,7 +245,6 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
                 pbar = it
 
             self.tloss = None
-            self.tloss1 = None
 
             if epoch < 200:
                 lamda = 0
@@ -305,13 +268,6 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
                         )
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
-                    if self.teacher_optimizer is not None:
-                        for j, x in enumerate(self.teacher_optimizer.param_groups):
-                            x["lr"] = np.interp(
-                                ni, xi, [self.args.warmup_bias_lr if j == 0 else 0.0, x["initial_lr"] * self.lf(epoch)]
-                            )
-                            if "momentum" in x:
-                                x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
                 with autocast(self.amp):
                     if batch is not None:
@@ -319,80 +275,54 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
                     unsup_batch = self.preprocess_semi_batch(unsup_batch)
 
                     if not self.auto_train:
-                        # Step 1: Student model learns from labeled data
+                        # Student model learns from labeled data
                         self.loss, self.loss_items = self.model(batch)
                         self.total_loss = self.loss
-
-                        self.loss1, self.loss_items1 = self.teacher_model(batch)
-                        self.total_loss1 = self.loss1
                     else:
-                        self.loss1 = self.loss = 0
+                        self.loss = 0
 
                     if lamda != 0:
-                        # Weak augmentation on unsupervised data
+                        # Step 1: Teacher generates pseudo-labels (autocast DISABLED for teacher)
                         unsup_w = deepcopy(unsup_batch)
                         unsup_w, horizons = self.weak_aug(unsup_w)
+                        unsup_w["img"] = unsup_w["img"].to(self.device)
 
-                        # Step 2: Teacher generates pseudo-labels, student learns
-                        with torch.no_grad():
-                            self.model.train()
-                            self.teacher_model.eval()
-                            pseudo_pred, _ = self.teacher_model(unsup_w)
-                            pseudo_box_label = self.get_pseudo_box_label(pseudo_pred[0])
-                            pseudo_label = self.get_pseudo_label(pseudo_box_label)
-                            # Callback: flip pseudo-labels if weak aug flipped the image
-                            pseudo_label = self.horizonFlip(pseudo_label, horizons)
-                            # Strong augmentation
-                            unsup_s = deepcopy(unsup_batch)
-                            unsup_s = align_batch(unsup_s, pseudo_label)
-                            unsup_s = self.strong_aug(unsup_s)
+                        with torch.amp.autocast("cuda", enabled=False):
+                            with torch.no_grad():
+                                self.teacher_model.eval()
+                                pseudo_pred, _ = self.teacher_model(unsup_w)
+                                pseudo_box_label = self.get_pseudo_box_label(pseudo_pred[0])
+                                pseudo_label = self.get_pseudo_label(pseudo_box_label)
+                                pseudo_label = self.horizonFlip(pseudo_label, horizons)
 
+                        # Step 2: Prepare strong-augmented data (FP32, outside teacher's autocast-off)
+                        unsup_s = deepcopy(unsup_batch)
+                        unsup_s = align_batch(unsup_s, pseudo_label)
+                        unsup_s = self.strong_aug(unsup_s)
+
+                        # Step 3: Student learns from pseudo-labeled data (inside outer autocast)
                         unlabel_pred, _ = self.model(unsup_s)
                         self.unsup_loss, unsup_loss_items = self.model.module.new_unsup_loss(unlabel_pred, unsup_s)
 
-                        # Step 3: Student generates pseudo-labels, teacher learns
-                        with torch.no_grad():
-                            self.teacher_model.train()
-                            self.model.eval()
-                            pseudo_pred1, _ = self.model(unsup_w)
-                            pseudo_box_label1 = self.get_pseudo_box_label(pseudo_pred1[0])
-                            pseudo_label1 = self.get_pseudo_label(pseudo_box_label1)
-                            pseudo_label1 = self.horizonFlip(pseudo_label1, horizons)
-                            unsup_s1 = deepcopy(unsup_batch)
-                            unsup_s1 = align_batch(unsup_s1, pseudo_label1)
-                            unsup_s1 = self.strong_aug(unsup_s1)
-
-                        unlabel_pred1, _ = self.teacher_model(unsup_s1)
-                        self.unsup_loss1, unsup_loss_items1 = self.teacher_model.module.new_unsup_loss(unlabel_pred1, unsup_s1)
-
                         if self.auto_train:
                             self.total_loss = self.unsup_loss
-                            self.total_loss1 = self.unsup_loss1
                             self.loss_items = unsup_loss_items
-                            self.loss_items1 = unsup_loss_items1
                             self.loss = self.unsup_loss
-                            self.loss1 = self.unsup_loss1
                         else:
                             self.total_loss = ((1 - lamda) * self.loss + (lamda * 1) * self.unsup_loss)
-                            self.total_loss1 = ((1 - lamda) * self.loss1 + (lamda * 1) * self.unsup_loss1)
 
-                    self.teacher_model.train()
                     self.model.train()
 
                     self.tloss = (
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
-                    self.tloss1 = (
-                        (self.tloss1 * i + self.loss_items1) / (i + 1) if self.tloss1 is not None else self.loss_items1
-                    )
 
-                    # Backward pass
+                    # Backward pass (student only)
                 self.scaler.scale(self.total_loss).backward()
-                self.scaler.scale(self.total_loss1).backward()
 
                 if ni - last_opt_step >= self.accumulate:
                     self.optimizer_step()
-                    self.optimizer_teacher_step()
+                    self.update_teacher_ema()  # EMA update after each optimizer step
                     last_opt_step = ni
 
                     # Timed stopping
@@ -406,7 +336,7 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
                             break
 
                 if RANK in {-1, 0}:
-                    loss_length = self.tloss.shape[0] + (self.tloss1.shape[0]) if len(self.tloss.shape) else 1
+                    loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
                     pbar.set_description(
                         ("%11s" * 2 + "%11.4g" * (2 + loss_length))
                         % (
@@ -415,7 +345,6 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
                             *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),
                             unsup_batch["img"].shape[0] if self.auto_train else batch["cls"].shape[0],
                             unsup_batch["img"].shape[-1] if self.auto_train else batch["img"].shape[-1],
-                            *(self.tloss1 if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),
                         )
                     )
                     self.run_callbacks("on_batch_end")
@@ -483,15 +412,10 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
         ckpt = self.setup_model()
 
         self.model = self.model.to(self.device)
-
-        if self.teacher_model is not None:
-            teacher_ckpt = self.setup_teacher_model()
-            self.teacher_model = self.teacher_model.to(self.device)
-
         self.best_student = None
         self.set_model_attributes()
 
-        # Freeze layers
+        # Freeze layers (student only)
         freeze_list = (
             self.args.freeze
             if isinstance(self.args.freeze, list)
@@ -507,22 +431,9 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
                 v.requires_grad = False
             elif not v.requires_grad and v.dtype.is_floating_point:
                 LOGGER.info(
-                    f"WARNING ⚠️ setting 'requires_grad=True' for frozen layer '{k}'. "
-                    "See ultralytics.engine.trainer for customization of frozen layers."
+                    f"WARNING: setting 'requires_grad=True' for frozen layer '{k}'."
                 )
                 v.requires_grad = True
-
-        if self.teacher_model is not None:
-            for k, v in self.teacher_model.named_parameters():
-                if any(x in k for x in freeze_layer_names):
-                    LOGGER.info(f"Freezing layer '{k}'")
-                    v.requires_grad = False
-                elif not v.requires_grad and v.dtype.is_floating_point:
-                    LOGGER.info(
-                        f"WARNING ⚠️ setting 'requires_grad=True' for frozen layer '{k}'. "
-                        "See ultralytics.engine.trainer for customization of frozen layers."
-                    )
-                    v.requires_grad = True
 
         # Check AMP
         self.amp = torch.tensor(self.args.amp).to(self.device)
@@ -538,10 +449,19 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
         )
         if world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True, broadcast_buffers=False)
-            if self.teacher_model is not None:
-                self.teacher_model = nn.parallel.DistributedDataParallel(self.teacher_model, device_ids=[RANK], find_unused_parameters=True, broadcast_buffers=False)
+            # Teacher model is NOT wrapped in DDP (no gradients needed)
 
         self.first_unsup = True
+
+        # Create teacher model as deep copy of student (EMA initialization)
+        student_for_teacher = self.model.module if hasattr(self.model, "module") else self.model
+        self.teacher_model = deepcopy(student_for_teacher)
+        self.teacher_model = self.teacher_model.to(self.device)
+        # Freeze all teacher parameters (no gradients)
+        for p in self.teacher_model.parameters():
+            p.requires_grad = False
+        self.teacher_model.eval()
+        LOGGER.info("Teacher model initialized as deep copy of student (EMA)")
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)
@@ -565,12 +485,10 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
             self.ema = ModelEMA(self.model)
-            if self.teacher_model is not None:
-                self.teacher_ema = ModelEMA(self.teacher_model)
             if self.args.plots:
                 self.plot_training_labels()
 
-        # Optimizer
+        # Optimizer (student only, no teacher optimizer)
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)
         weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs
         iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
@@ -582,20 +500,11 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
             decay=weight_decay,
             iterations=iterations,
         )
-        self.teacher_optimizer = self.build_optimizer(
-            model=self.teacher_model,
-            name=self.args.optimizer,
-            lr=self.args.lr0,
-            momentum=self.args.momentum,
-            decay=weight_decay,
-            iterations=iterations,
-        )
-        # Scheduler
+
+        # Scheduler (student only)
         self._setup_scheduler()
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
         self.resume_training(ckpt)
-        if teacher_ckpt is not None:
-            self.resume_unsup_training(teacher_ckpt)
         self.scheduler.last_epoch = self.start_epoch - 1
         self.run_callbacks("on_pretrain_routine_end")
 
@@ -614,30 +523,11 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
         self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)
         return ckpt
 
-    def setup_teacher_model(self):
-        """Load/create/download teacher model."""
-        if isinstance(self.teacher_model, torch.nn.Module):
-            return
-
-        cfg, weights = self.teacher_model, None
-        ckpt = None
-        if str(self.teacher_model).endswith(".pt"):
-            weights, ckpt = attempt_load_one_weight(self.teacher_model)
-            cfg = weights.yaml
-        elif isinstance(self.args.pretrained, (str, Path)):
-            weights, _ = attempt_load_one_weight(self.args.pretrained)
-        self.teacher_model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)
-        return ckpt
-
     def set_model_attributes(self):
         """Set model attributes for semi-detection."""
         self.model.nc = self.data["nc"]
         self.model.names = self.data["names"]
         self.model.args = self.args
-        if self.teacher_model:
-            self.teacher_model.nc = self.data["nc"]
-            self.teacher_model.names = self.data["names"]
-            self.teacher_model.args = self.args
 
     def get_dataset(self):
         """Load semi-supervised dataset configs."""
@@ -651,8 +541,6 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
         else:
             self.lf = lambda x: max(1 - x / self.epochs, 0) * (1.0 - self.args.lrf) + self.args.lrf
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)
-        if self.teacher_optimizer is not None:
-            self.teacher_scheduler = optim.lr_scheduler.LambdaLR(self.teacher_optimizer, lr_lambda=self.lf)
 
     def preprocess_batch(self, batch):
         """Preprocesses a batch of images by scaling and converting to float."""
@@ -695,19 +583,14 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
         return batch
 
     def get_pseudo_box_label(self, preds):
-        """Apply NMS to raw predictions and return per-image detection results.
-
-        For detection mode: preds shape is (bs, 4+nc, n_anchors), no mask coefficients.
-        Returns list of tensors, each [N, 6] = (xyxy, conf, cls).
-        """
+        """Apply NMS to raw predictions and return per-image detection results."""
         conf_thres = 0.25
         iou_thres = 0.45
-        classes = None
         max_wh = 4096
 
         bs = preds.shape[0]
-        nc = preds.shape[1] - 4  # number of classes (no mask coefficients for detection)
-        xc = preds[:, 4:4 + nc].amax(1) > conf_thres  # candidates
+        nc = preds.shape[1] - 4
+        xc = preds[:, 4:4 + nc].amax(1) > conf_thres
 
         preds = preds.transpose(-1, -2)
         tmp = preds
@@ -717,84 +600,34 @@ class SemiDetectionTrainer(yolo.detect.DetectionTrainer):
         max_nms = 30000
 
         for xi, x in enumerate(preds):
-            x = x[xc[xi]]  # confidence filter
-
+            x = x[xc[xi]]
             if not x.shape[0]:
                 continue
-
-            # Detections matrix nx6 (xyxy, conf, cls) — no mask for detection
             box, cls = x.split((4, nc), 1)
             conf, j = cls.max(1, keepdim=True)
             x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
-
             n = x.shape[0]
             if not n:
                 continue
             if n > max_nms:
                 x = x[x[:, 4].argsort(descending=True)[:max_nms]]
-
-            c = x[:, 5:6] * max_wh  # class offset
+            c = x[:, 5:6] * max_wh
             scores = x[:, 4]
             boxes = x[:, :4] + c
             i = torchvision.ops.nms(boxes, scores, iou_thres)
-
             output[xi] = x[i]
 
         return output
 
     def get_pseudo_label(self, p):
-        """Convert NMS results to pseudo-labels (detection-only: boxes only, no masks).
-
-        Args:
-            p: list of tensors, each [N, 6] = (xyxy, conf, cls)
-
-        Returns:
-            list of tensors, same format (identity for detection mode)
-        """
+        """Convert NMS results to pseudo-labels."""
         pseudo_label = []
         for i, pred in enumerate(p):
             if len(pred) == 0:
                 pseudo_label.append(pred)
             else:
-                pseudo_label.append(pred[:, :6])  # xyxy + conf + cls
+                pseudo_label.append(pred[:, :6])
         return pseudo_label
-
-    def resume_unsup_training(self, ckpt):
-        """Resume teacher model training from checkpoint."""
-        if ckpt is None or not self.resume:
-            return
-        best_fitness = 0.0
-        start_epoch = ckpt.get("epoch", -1) + 1
-        if ckpt.get("optimizer", None) is not None:
-            self.teacher_optimizer.load_state_dict(ckpt["optimizer"])
-            best_fitness = ckpt["best_fitness"]
-        if self.teacher_ema and ckpt.get("ema"):
-            self.teacher_ema.ema.load_state_dict(ckpt["ema"].float().state_dict())
-            self.teacher_ema.updates = ckpt["updates"]
-        assert start_epoch > 0, (
-            f"{self.args.model} training to {self.epochs} epochs is finished, nothing to resume.\n"
-            f"Start a new training without resuming, i.e. 'yolo train model={self.args.model}'"
-        )
-        LOGGER.info(f"Resuming training {self.args.model} from epoch {start_epoch + 1} to {self.epochs} total epochs")
-        if self.epochs < start_epoch:
-            LOGGER.info(
-                f"{self.teacher_model} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {self.epochs} more epochs."
-            )
-            self.epochs += ckpt["epoch"]
-        self.best_fitness = best_fitness
-        self.start_epoch = start_epoch
-        if start_epoch > (self.epochs - self.args.close_mosaic):
-            self._close_dataloader_mosaic()
-
-    def optimizer_teacher_step(self):
-        """Perform a single step of the teacher optimizer with gradient clipping."""
-        self.scaler.unscale_(self.teacher_optimizer)
-        torch.nn.utils.clip_grad_norm_(self.teacher_model.parameters(), max_norm=10.0)
-        self.scaler.step(self.teacher_optimizer)
-        self.scaler.update()
-        self.teacher_optimizer.zero_grad()
-        if self.teacher_ema:
-            self.teacher_ema.update(self.teacher_model)
 
     def teacher_validate(self):
         """Run teacher validation on test set."""
@@ -839,7 +672,7 @@ def check_semi_seg_dataset(dataset, unsup_dataset):
             unsup_data[k] = [str((path / y).resolve()) for y in unsup_data[k]]
 
     if "names" not in data and "nc" not in data:
-        raise SyntaxError(emojis(f"{dataset} key missing ❌.\n either 'names' or 'nc' are required in all data YAMLs."))
+        raise SyntaxError(emojis(f"{dataset} key missing. either 'names' or 'nc' are required in all data YAMLs."))
     if "names" in data and "nc" in data and len(data["names"]) != data["nc"]:
         raise SyntaxError(emojis(f"{dataset} 'names' length {len(data['names'])} and 'nc: {data['nc']}' must match."))
     if "names" not in data:
@@ -853,12 +686,7 @@ def check_semi_seg_dataset(dataset, unsup_dataset):
 
 
 def align_batch(batch, labels):
-    """Align pseudo-labels into batch format (detection-only: no masks).
-
-    Args:
-        batch: dict with 'img', 'cls', 'bboxes', 'batch_idx' keys
-        labels: list of Tensor[N, 6] (xyxy + conf + cls), one per image
-    """
+    """Align pseudo-labels into batch format (detection-only: no masks)."""
     batch_idx = []
     device = batch['img'].device
     batch['cls'] = torch.empty(0, 1, device=device)

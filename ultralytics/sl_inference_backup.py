@@ -118,6 +118,22 @@ def get_all_eics_via_roi(datadir, ppm=10, roi_delta_mz=0.005, required_points=8,
         all_eics.append(eics)
     return all_eics
 
+
+def get_eics_for_single_file(path, ppm=10, roi_delta_mz=0.005, required_points=8, dropped_points=3,
+                             min_nonzero_points=3, min_height=0.0):
+    """
+    对单个 mzML 文件：构建 ROI -> 导出 EIC 列表。
+    返回: eics 列表（list[dict]）
+    """
+    rois, _ = build_rois_for_file(
+        path, ppm=ppm, roi_delta_mz=roi_delta_mz,
+        required_points=required_points, dropped_points=dropped_points
+    )
+    eics = make_eics_from_rois(
+        rois, path, min_nonzero_points=min_nonzero_points, min_height=min_height
+    )
+    return eics
+
 def build_rois_for_file(path, ppm=10, roi_delta_mz=0.02, required_points=8, dropped_points=3):
     """
     从单个 mzML 构建 ROI 列表（仅 MS1）。
@@ -580,29 +596,45 @@ def chooseMask(point, x, y, prefer_left=False):
 
 
 def save_result(results, eics_per_file, args):
-    save_csv = bool(args.save_csv)
-    save_images = bool(args.save_images)
-    images_dir = Path(args.images_dir) if hasattr(args, "images_dir") and args.images_dir else None
-    window_size = float(getattr(args, "images_window_size", 2.0))  # 绘图窗口大小（分钟），默认 2 分钟
-
+    """批量保存（兼容旧调用），内部逐文件保存。"""
     p = Path(args.datadir).resolve()
     paths = [path for path in p.glob("*.mzML")]
     paths = sorted(paths, key=lambda x: x.as_posix())
 
+    for index in range(len(paths)):
+        save_single_file_result(
+            results=[results[index]],
+            eics_per_file=[eics_per_file[index]],
+            mzml_paths=[paths[index]],
+            args=args
+        )
+
+def save_single_file_result(results, eics_per_file, mzml_paths, args):
+    """
+    保存单个文件的结果（CSV 和/或图像）。
+    - results: list[list[eic_peaks]]，长度为1
+    - eics_per_file: list[list[eic_dict]]，长度为1
+    - mzml_paths: list[Path]，长度为1
+    """
+    save_csv = bool(args.save_csv)
+    save_images = bool(args.save_images)
+    images_dir = Path(args.images_dir) if hasattr(args, "images_dir") and args.images_dir else None
+    window_size = float(getattr(args, "images_window_size", 2.0))
+
     # 1) 保存 CSV
-    if save_csv:#peak:[x1(x_min), x2(x_max), y1(y_max), y2(y_min), conf, peak_rt, mz, peak_area_sum, mzmin, mzmax, sample]
+    if save_csv:
         title = ['mz','mzmin','mzmax','rt', 'rtmin', 'rtmax', 'into','maxo', 'sample', 'conf']
 
-        # 新增：确定 CSV 保存路径
         if hasattr(args, "csv_save_dir") and args.csv_save_dir:
             csv_root = Path(args.csv_save_dir).resolve()
         else:
-            csv_root = Path(p).joinpath("ours/csv")
+            p = Path(args.datadir).resolve()
+            csv_root = p.joinpath("ours/csv")
         csv_root.mkdir(parents=True, exist_ok=True)
 
-        for index in range(len(paths)):
+        for index in range(len(mzml_paths)):
             result = results[index]
-            path = paths[index]
+            path = mzml_paths[index]
             csv_path = csv_root / f"{path.stem}.csv"
             with open(csv_path, "w", newline='') as file:
                 writer = csv.writer(file)
@@ -630,6 +662,7 @@ def save_result(results, eics_per_file, args):
                 })
                 grouped.columns = [str(col) for col in grouped.columns]
                 grouped.to_csv(csv_path, index=False)
+            print(f"[CSV] Saved: {csv_path}")
 
     # 2) 保存 EIC 局部图像（rt vs intensity）
     if save_images:
@@ -637,12 +670,12 @@ def save_result(results, eics_per_file, args):
             images_dir = Path(args.datadir) / "peak_images"
         images_dir.mkdir(parents=True, exist_ok=True)
 
-        skyblue_hex = "#87CEEB"  # 'bluesky' 对应 skyblue
+        skyblue_hex = "#87CEEB"
 
-        for file_idx in range(len(paths)):
-            result = results[file_idx]         # 该文件中，各 EIC 的峰列表
-            file_eics = eics_per_file[file_idx]  # 该文件中，各 EIC 的数据
-            mzml_path = paths[file_idx]
+        for file_idx in range(len(mzml_paths)):
+            result = results[file_idx]
+            file_eics = eics_per_file[file_idx]
+            mzml_path = mzml_paths[file_idx]
             file_out_dir = images_dir / mzml_path.stem
             file_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -650,7 +683,7 @@ def save_result(results, eics_per_file, args):
             for eic_idx, (peaks, eic) in enumerate(zip(result, file_eics)):
                 if len(peaks) == 0:
                     continue
-                x = np.asarray(eic["rt_min"], dtype=float)  # 分钟
+                x = np.asarray(eic["rt_min"], dtype=float)
                 y = np.asarray(eic["int"], dtype=float)
                 mz = float(eic["mz"])
                 if len(x) == 0:
@@ -659,13 +692,11 @@ def save_result(results, eics_per_file, args):
                 eic_start, eic_end = float(x[0]), float(x[-1])
                 eic_span = eic_end - eic_start
 
-                # 构造绘图窗口（单个或多个）
                 if eic_span <= window_size:
                     windows = [(eic_start, eic_end, peaks)]
                 else:
                     windows = group_peaks_into_windows(peaks, window_size, eic_start, eic_end)
 
-                # 绘制每个窗口
                 for (win_start, win_end, group_peaks) in windows:
                     mask = (x >= win_start) & (x <= win_end)
                     if not np.any(mask):
@@ -680,11 +711,9 @@ def save_result(results, eics_per_file, args):
                     plt.ylim(0, max(1.0, float(y_sub.max()) * 1.1))
                     plt.xlim(x_sub[0], x_sub[-1])
 
-                    # 用填充方式标注每个峰的 [rt_left, rt_right]
                     for peak in group_peaks:
                         rt_left = float(peak[0])
                         rt_right = float(peak[1])
-                        # 与当前窗口相交的部分进行填充
                         mask_fill = (x_sub >= rt_left) & (x_sub <= rt_right)
                         if np.any(mask_fill):
                             plt.fill_between(x_sub, 0, y_sub, where=mask_fill,
@@ -699,7 +728,6 @@ def save_result(results, eics_per_file, args):
 
             print(f"[Images] Saved {saved} EIC peak images to: {file_out_dir}")
 
-# 新增：将同一 EIC 内的峰按 2 分钟窗口分组
 def group_peaks_into_windows(peaks, window_size, eic_start, eic_end):
     """
     peaks: list of peak records for one EIC; each peak: [rt_left(0), rt_right(1), ..., rt_med(6), mz(7), ...]
@@ -836,23 +864,64 @@ def get_args():
     return parser
 
 def main(args):
-    # 1) 基于 ROI 生成所有 EIC
-    eics_per_file = get_all_eics_via_roi(
-        datadir=args.datadir,
-        ppm=int(args.ppm),
-        roi_delta_mz=float(args.roi_delta_mz),
-        required_points=int(args.roi_required_points),
-        dropped_points=int(args.roi_dropped_points),
-        min_nonzero_points=int(args.min_nonzero_points),
-        min_height=float(args.min_height)
-    )
-    
-    results = inference(
-        eics_per_file=eics_per_file,
-        args=args
-    )
+    # 0) 获取所有 mzML 文件列表
+    p = Path(args.datadir).resolve()
+    all_paths = [path for path in p.glob("*.mzML")]
+    all_paths = natsorted(all_paths)
+    if not all_paths:
+        raise FileNotFoundError(f"No mzML found under: {args.datadir}")
 
-    save_result(results, eics_per_file, args)
+    # 1) 幂等检查：确定 CSV 输出目录，检查已完成的文件
+    if hasattr(args, "csv_save_dir") and args.csv_save_dir:
+        csv_root = Path(args.csv_save_dir).resolve()
+    else:
+        csv_root = p.joinpath("ours/csv")
+
+    existing_csvs = set()
+    if csv_root.exists():
+        for csv_file in csv_root.glob("*.csv"):
+            existing_csvs.add(csv_file.stem)
+
+    # 筛选出尚未处理的 mzML 文件
+    pending_paths = [path for path in all_paths if path.stem not in existing_csvs]
+
+    total = len(all_paths)
+    done = total - len(pending_paths)
+    print(f"[Idempotent] Total mzML files: {total}, already completed: {done}, pending: {len(pending_paths)}")
+
+    if not pending_paths:
+        print("[Idempotent] All files already processed. Skipping entire pipeline.")
+        return
+
+    # 2) 逐文件处理：读取 -> ROI -> EIC -> 推断 -> 保存
+    for file_idx, mzml_path in enumerate(pending_paths):
+        print(f"\n[Processing] ({file_idx + 1}/{len(pending_paths)}) {mzml_path.name}")
+
+        # 2a) 单文件 ROI + EIC
+        eics = get_eics_for_single_file(
+            mzml_path,
+            ppm=int(args.ppm),
+            roi_delta_mz=float(args.roi_delta_mz),
+            required_points=int(args.roi_required_points),
+            dropped_points=int(args.roi_dropped_points),
+            min_nonzero_points=int(args.min_nonzero_points),
+            min_height=float(args.min_height)
+        )
+
+        # 2b) 单文件推断（inference 接受 list[list[eic]] 格式）
+        results = inference(eics_per_file=[eics], args=args)
+
+        # 2c) 单文件保存
+        save_single_file_result(
+            results=results,
+            eics_per_file=[eics],
+            mzml_paths=[mzml_path],
+            args=args
+        )
+
+        print(f"[Completed] {mzml_path.name} saved successfully.")
+
+    print(f"\n[Done] Processed {len(pending_paths)} file(s). Total completed: {total}/{total}")
 
 
 if __name__ == "__main__":

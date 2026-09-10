@@ -62,11 +62,17 @@ class YOLO(Model):
                 "validator": yolo.semi_segment.SemiSegmentationValidator,
                 "predictor": yolo.semi_segment.SemiSegmentationPredictor,
             },
-            "semi_detect":{
+            "semi_detect": {
                 "model": SemiDetectionModel,
                 "trainer": yolo.semi_detect.SemiDetectionTrainer,
                 "validator": yolo.semi_detect.SemiDetectionValidator,
                 "predictor": yolo.semi_detect.SemiDetectionPredictor,
+            },
+            "semi_detect_ema": {
+                "model": SemiDetectionModel,
+                "trainer": yolo.semi_detect_ema.EMASemiDetectionTrainer,
+                "validator": yolo.semi_detect_ema.SemiDetectionValidator,
+                "predictor": yolo.semi_detect_ema.SemiDetectionPredictor,
             },
         }
 

@@ -130,7 +130,7 @@ class BaseTrainer:
         # Model and Dataset
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolov8n -> yolov8n.pt
         with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
-            if self.args.task == "semi_segment" or self.args.task == "semi_detect":
+            if self.args.task in ("semi_segment", "semi_detect", "semi_detect_ema"):
                 self.trainset, self.unsupset,self.testset = self.get_dataset()
             else:
                 self.trainset, self.testset = self.get_dataset()
